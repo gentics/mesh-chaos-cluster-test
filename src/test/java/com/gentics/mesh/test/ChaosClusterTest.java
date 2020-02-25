@@ -199,13 +199,17 @@ public class ChaosClusterTest extends AbstractClusterTest {
 				}
 				break;
 			case SPLIT_BRAIN:
+				// TODO Check whether brain is already split
 				invokeSplitBrain();
 				break;
 			case MERGE_BRAIN:
+				// TODO check whether brain is split
 				mergeSplitBrain();
 				break;
 			case CONNECT_SERVER:
-				connectServer();
+				if (!disconnectedServers.isEmpty()) {
+					connectServer();
+				}
 				return;
 			case DISCONNECT_SERVER:
 				disconnectServer();
