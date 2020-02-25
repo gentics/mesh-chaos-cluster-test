@@ -8,12 +8,21 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.Test;
 
+import com.gentics.mesh.FieldUtil;
+import com.gentics.mesh.core.rest.node.NodeCreateRequest;
+import com.gentics.mesh.core.rest.project.ProjectCreateRequest;
+import com.gentics.mesh.core.rest.project.ProjectResponse;
+import com.gentics.mesh.core.rest.schema.impl.SchemaCreateRequest;
+import com.gentics.mesh.core.rest.schema.impl.SchemaResponse;
+import com.gentics.mesh.core.rest.schema.impl.SchemaUpdateRequest;
 import com.gentics.mesh.core.rest.user.UserCreateRequest;
 import com.gentics.mesh.core.rest.user.UserResponse;
 import com.gentics.mesh.test.docker.MeshContainer;
+import com.gentics.mesh.util.UUIDUtil;
 
 public class ChaosClusterTest extends AbstractClusterTest {
 
@@ -25,6 +34,10 @@ public class ChaosClusterTest extends AbstractClusterTest {
 		// Set the seed to get repeatable random operations
 		random.setSeed(42L);
 	}
+
+	private static final String SCHEMA_NAME = "TestSchema";
+
+	private static final String PROJECT_NAME = "Dummy";
 
 	private static final int STARTUP_TIMEOUT = 100;
 
@@ -42,10 +55,16 @@ public class ChaosClusterTest extends AbstractClusterTest {
 
 	private static final List<String> userUuids = new ArrayList<>();
 
+	private static final List<String> nodeUuids = new ArrayList<>();
+
+	private static final AtomicReference<String> schemaUuid = new AtomicReference<>();
+
+	private static final AtomicReference<ProjectResponse> project = new AtomicReference<>();
+
 	private static int nAction = 0;
 
 	private enum Actions {
-		ADD, REMOVE, UTILIZE, STOP, START, KILL, BACKUP, SPLIT_BRAIN, MERGE_BRAIN, DISCONNECT_SERVER, CONNECT_SERVER, SCHEMA_MIGRATION;
+		ADD, REMOVE, CREATE_USER, CREATE_NODE, STOP, START, KILL, BACKUP, SPLIT_BRAIN, MERGE_BRAIN, DISCONNECT_SERVER, CONNECT_SERVER, SCHEMA_MIGRATION;
 
 		public static Actions random() {
 			return values()[random.nextInt(values().length)];
@@ -104,7 +123,46 @@ public class ChaosClusterTest extends AbstractClusterTest {
 		server.start();
 		server.awaitStartup(STARTUP_TIMEOUT);
 		server.login();
+
 		runningServers.add(server);
+		setupInitialServer(server);
+	}
+
+	private void setupInitialServer(MeshContainer server) {
+		// 1. Create Schema
+		SchemaCreateRequest schemaCreateRequest = new SchemaCreateRequest();
+		schemaCreateRequest.setName(SCHEMA_NAME);
+		schemaCreateRequest.setContainer(false);
+		schemaCreateRequest.setDescription("Test schema");
+		schemaCreateRequest.setDisplayField("name");
+		schemaCreateRequest.addField(FieldUtil.createStringFieldSchema("name"));
+		schemaCreateRequest.addField(FieldUtil.createStringFieldSchema("content"));
+		SchemaResponse response = call(() -> server.client().createSchema(schemaCreateRequest));
+		schemaUuid.set(response.getUuid());
+
+		// 2. Create project
+		ProjectCreateRequest projectRequest = new ProjectCreateRequest();
+		projectRequest.setName(PROJECT_NAME);
+		projectRequest.setSchemaRef("folder");
+		ProjectResponse projectResponse = call(() -> server.client().createProject(projectRequest));
+		project.set(projectResponse);
+
+		// 3. Assign schema to project
+		call(() -> server.client().assignSchemaToProject(PROJECT_NAME, schemaUuid.get()));
+
+		// 4. Create node
+		createNode(server);
+
+	}
+
+	private void createNode(MeshContainer server) {
+		NodeCreateRequest nodeCreateRequest = new NodeCreateRequest();
+		nodeCreateRequest.setLanguage("en");
+		nodeCreateRequest.setParentNodeUuid(project.get().getRootNode().getUuid());
+		nodeCreateRequest.setSchemaName(SCHEMA_NAME);
+		nodeCreateRequest.getFields().put("name", FieldUtil.createStringField("Node Name"));
+		nodeCreateRequest.getFields().put("content", FieldUtil.createStringField("Node Content"));
+		nodeUuids.add(call(() -> server.client().createNode(PROJECT_NAME, nodeCreateRequest)).getUuid());
 	}
 
 	private void applyAction() throws InterruptedException {
@@ -122,9 +180,15 @@ public class ChaosClusterTest extends AbstractClusterTest {
 					return;
 				}
 				break;
-			case UTILIZE:
+			case CREATE_USER:
 				if (!runningServers.isEmpty()) {
-					utilizeServer();
+					createUser();
+					return;
+				}
+				break;
+			case CREATE_NODE:
+				if (!runningServers.isEmpty()) {
+					createNode(randomRunningServer());
 					return;
 				}
 				break;
@@ -174,7 +238,17 @@ public class ChaosClusterTest extends AbstractClusterTest {
 	}
 
 	private void invokeSchemaMigration() {
-		System.err.println("Invoking schema migration");
+		MeshContainer s = randomRunningServer();
+		System.err.println("Invoking schema migration " + s.getNodeName());
+		SchemaUpdateRequest request = new SchemaUpdateRequest();
+		request.setName(SCHEMA_NAME);
+		request.setContainer(false);
+		// Randomize the description to invoke a migration
+		request.setDescription("Test schema" + UUIDUtil.randomUUID());
+		request.setDisplayField("name");
+		request.addField(FieldUtil.createStringFieldSchema("name"));
+		request.addField(FieldUtil.createStringFieldSchema("content"));
+		call(() -> s.client().updateSchema(schemaUuid.get(), request));
 	}
 
 	private void invokeSplitBrain() {
@@ -216,7 +290,7 @@ public class ChaosClusterTest extends AbstractClusterTest {
 
 		MeshContainer server = addSlave(CLUSTERNAME + clusterPostFix, name, dataPrefix, false);
 		server.awaitStartup(STARTUP_TIMEOUT);
-		server.client().login();
+		server.login();
 		runningServers.add(server);
 	}
 
@@ -225,7 +299,7 @@ public class ChaosClusterTest extends AbstractClusterTest {
 		System.err.println("Adding server: " + name);
 		MeshContainer server = addSlave(CLUSTERNAME + clusterPostFix, name, name, false);
 		server.awaitStartup(STARTUP_TIMEOUT);
-		server.client().login();
+		server.login();
 		runningServers.add(server);
 	}
 
@@ -246,15 +320,15 @@ public class ChaosClusterTest extends AbstractClusterTest {
 	}
 
 	private void backupServer() {
-		System.err.println("Backup server...");
 		MeshContainer s = randomRunningServer();
+		System.err.println("Invoking backup on server " + s.getNodeName());
 		call(() -> s.client().invokeBackup());
 		System.err.println("Invoked backup on server: " + s.getNodeName());
 	}
 
-	private void utilizeServer() {
-		System.err.println("Utilize server...");
+	private void createUser() {
 		MeshContainer s = randomRunningServer();
+		System.err.println("Utilize server " + s.getNodeName());
 		UserCreateRequest request = new UserCreateRequest();
 		request.setPassword("somepass");
 		request.setUsername(randomName());

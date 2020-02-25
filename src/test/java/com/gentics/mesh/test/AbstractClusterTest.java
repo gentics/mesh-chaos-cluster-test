@@ -60,8 +60,8 @@ public class AbstractClusterTest {
 		return "random" + System.currentTimeMillis();
 	}
 
-	public MeshContainer addSlave(String string, String name, String name2, boolean b) {
-		return addSlave(string, name, name2, b, -1);
+	public MeshContainer addSlave(String clusterName, String nodeName, String dataPathPostfix, boolean b) {
+		return addSlave(clusterName, nodeName, dataPathPostfix, b, -1);
 	}
 
 	/**
