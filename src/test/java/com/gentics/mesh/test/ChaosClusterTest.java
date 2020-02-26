@@ -1,7 +1,9 @@
 package com.gentics.mesh.test;
 
 import static com.gentics.mesh.test.ClientHelper.call;
+import static com.gentics.mesh.test.util.TestUtils.sleep;
 import static com.gentics.mesh.util.UUIDUtil.randomUUID;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
 import java.io.IOException;
@@ -13,6 +15,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.Test;
 
 import com.gentics.mesh.FieldUtil;
+import com.gentics.mesh.core.rest.admin.consistency.ConsistencyCheckResponse;
 import com.gentics.mesh.core.rest.node.NodeCreateRequest;
 import com.gentics.mesh.core.rest.project.ProjectCreateRequest;
 import com.gentics.mesh.core.rest.project.ProjectResponse;
@@ -23,6 +26,7 @@ import com.gentics.mesh.core.rest.user.UserCreateRequest;
 import com.gentics.mesh.core.rest.user.UserResponse;
 import com.gentics.mesh.test.docker.MeshContainer;
 import com.gentics.mesh.util.UUIDUtil;
+import com.google.common.collect.Lists;
 
 public class ChaosClusterTest extends AbstractClusterTest {
 
@@ -41,11 +45,15 @@ public class ChaosClusterTest extends AbstractClusterTest {
 
 	private static final int STARTUP_TIMEOUT = 100;
 
-	private static final int TOTAL_ACTIONS = 30;
+	private static final int TOTAL_ACTIONS = 40;
+
+	private static final int WRITE_QUORUM = 2;
 
 	private static final String CLUSTERNAME = "dummy";
 
 	private static final int SERVER_LIMIT = 8;
+
+	/* Test flags */
 
 	private static final List<MeshContainer> disconnectedServers = new ArrayList<>(SERVER_LIMIT);
 
@@ -61,10 +69,12 @@ public class ChaosClusterTest extends AbstractClusterTest {
 
 	private static final AtomicReference<ProjectResponse> project = new AtomicReference<>();
 
+	private boolean hasSplitBrain = false;
+
 	private static int nAction = 0;
 
 	private enum Actions {
-		ADD, REMOVE, CREATE_USER, CREATE_NODE, STOP, START, KILL, BACKUP, SPLIT_BRAIN, MERGE_BRAIN, DISCONNECT_SERVER, CONNECT_SERVER, SCHEMA_MIGRATION;
+		ADD_INSTANCE, REMOVE_INSTANCE, CREATE_USER, CREATE_NODE, STOP_INSTANCE, START_INSTANCE, KILL_INSTANCE, BACKUP_INSTANCE, SPLIT_BRAIN, MERGE_BRAIN, DISCONNECT_INSTANCE, CONNECT_INSTANCE, SCHEMA_MIGRATION;
 
 		public static Actions random() {
 			return values()[random.nextInt(values().length)];
@@ -117,6 +127,7 @@ public class ChaosClusterTest extends AbstractClusterTest {
 			.withNodeName("master")
 			.withClearFolders()
 			.withFilesystem()
+			.withWriteQuorum(WRITE_QUORUM)
 			.withDataPathPostfix("master")
 			.waitForStartup();
 
@@ -125,6 +136,7 @@ public class ChaosClusterTest extends AbstractClusterTest {
 		server.login();
 
 		runningServers.add(server);
+		reachWriteQuorum();
 		setupInitialServer(server);
 	}
 
@@ -168,70 +180,72 @@ public class ChaosClusterTest extends AbstractClusterTest {
 	private void applyAction() throws InterruptedException {
 		while (true) {
 			switch (Actions.random()) {
-			case ADD:
+			case ADD_INSTANCE:
 				if (runningServers.size() < SERVER_LIMIT) {
 					addServer();
 					return;
 				}
 				break;
-			case REMOVE:
+			case REMOVE_INSTANCE:
 				if (allowStopOrRemoval()) {
 					removeServer();
 					return;
 				}
 				break;
 			case CREATE_USER:
-				if (!runningServers.isEmpty()) {
+				if (meetsWriteQuorumRequirements()) {
 					createUser();
 					return;
 				}
 				break;
 			case CREATE_NODE:
-				if (!runningServers.isEmpty()) {
+				if (meetsWriteQuorumRequirements()) {
 					createNode(randomRunningServer());
 					return;
 				}
 				break;
 			case SCHEMA_MIGRATION:
-				if (!runningServers.isEmpty()) {
+				if (meetsWriteQuorumRequirements()) {
 					invokeSchemaMigration();
 					return;
 				}
 				break;
 			case SPLIT_BRAIN:
-				// TODO Check whether brain is already split
-				invokeSplitBrain();
+				if (!hasSplitBrain) {
+					invokeSplitBrain();
+				}
 				break;
 			case MERGE_BRAIN:
-				// TODO check whether brain is split
-				mergeSplitBrain();
+				if (hasSplitBrain) {
+					mergeSplitBrain();
+				}
 				break;
-			case CONNECT_SERVER:
+			case CONNECT_INSTANCE:
 				if (!disconnectedServers.isEmpty()) {
 					connectServer();
 				}
 				return;
-			case DISCONNECT_SERVER:
+			case DISCONNECT_INSTANCE:
 				disconnectServer();
 				return;
-			case KILL:
+			case KILL_INSTANCE:
 				if (allowStopOrRemoval()) {
 					killServer();
 				}
 				return;
-			case BACKUP:
+			case BACKUP_INSTANCE:
 				if (!runningServers.isEmpty()) {
 					backupServer();
 					return;
 				}
 				break;
-			case STOP:
+			case STOP_INSTANCE:
 				if (allowStopOrRemoval()) {
 					stopServer();
 					return;
 				}
 				break;
-			case START:
+			case START_INSTANCE:
 				if (!stoppedServers.isEmpty() && runningServers.size() < SERVER_LIMIT) {
 					startServer();
 					return;
@@ -257,10 +271,41 @@ public class ChaosClusterTest extends AbstractClusterTest {
 
 	private void invokeSplitBrain() {
 		System.err.println("Invoking split brain situation on cluster");
+		if (runningServers.size() % 2 == 0) {
+			List<List<MeshContainer>> lists = Lists.partition(runningServers, (runningServers.size() + 1) / 2);
+			List<MeshContainer> halfA = lists.get(0);
+			List<MeshContainer> halfB = lists.get(1);
+
+			// Drop Traffic in halfA to halfB
+			for (MeshContainer server : halfA) {
+				try {
+					server.dropTraffic(halfB.toArray(new MeshContainer[halfB.size()]));
+				} catch (Exception e) {
+					e.printStackTrace();
+				}
+			}
+			// Drop Traffic in halfB to halfA
+			for (MeshContainer server : halfB) {
+				try {
+					server.dropTraffic(halfA.toArray(new MeshContainer[halfA.size()]));
+				} catch (Exception e) {
+					e.printStackTrace();
+				}
+			}
+			hasSplitBrain = true;
+		}
 	}
 
 	private void mergeSplitBrain() {
 		System.err.println("Merging split brain in cluster");
+		for (MeshContainer server : runningServers) {
+			try {
+				server.resumeTraffic();
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+		}
+		hasSplitBrain = false;
 	}
 
 	private void connectServer() {
@@ -268,7 +313,7 @@ public class ChaosClusterTest extends AbstractClusterTest {
 		try {
 			System.err.println("Reconnecting server from cluster " + s.getNodeName());
 			s.resumeTraffic();
-		} catch (UnsupportedOperationException | IOException | InterruptedException e) {
+		} catch (Exception e) {
 			e.printStackTrace();
 		}
 		disconnectedServers.remove(s);
@@ -279,7 +324,7 @@ public class ChaosClusterTest extends AbstractClusterTest {
 		try {
 			System.err.println("Disconnecting server from cluster " + s.getNodeName());
 			s.dropTraffic();
-		} catch (UnsupportedOperationException | IOException | InterruptedException e) {
+		} catch (Exception e) {
 			e.printStackTrace();
 		}
 		disconnectedServers.add(s);
@@ -292,7 +337,7 @@ public class ChaosClusterTest extends AbstractClusterTest {
 		String dataPrefix = s.getDataPathPostfix();
 		stoppedServers.remove(s);
 
-		MeshContainer server = addSlave(CLUSTERNAME + clusterPostFix, name, dataPrefix, false);
+		MeshContainer server = addSlave(CLUSTERNAME + clusterPostFix, name, dataPrefix, false, WRITE_QUORUM);
 		server.awaitStartup(STARTUP_TIMEOUT);
 		server.login();
 		runningServers.add(server);
@@ -301,7 +346,7 @@ public class ChaosClusterTest extends AbstractClusterTest {
 	private void addServer() throws InterruptedException {
 		String name = randomName();
 		System.err.println("Adding server: " + name);
-		MeshContainer server = addSlave(CLUSTERNAME + clusterPostFix, name, name, false);
+		MeshContainer server = addSlave(CLUSTERNAME + clusterPostFix, name, name, false, WRITE_QUORUM);
 		server.awaitStartup(STARTUP_TIMEOUT);
 		server.login();
 		runningServers.add(server);
@@ -374,6 +419,11 @@ public class ChaosClusterTest extends AbstractClusterTest {
 	private void assertCluster() {
 		for (MeshContainer server : runningServers) {
 			System.out.println("Asserting server " + server.getNodeName());
+
+			// Verify consistency
+			ConsistencyCheckResponse report = call(() -> server.client().checkConsistency());
+			assertEquals("The database in server {" + server.getNodeName() + "} is not consistent.", 0, report.getInconsistencies().size());
+
 			// Verify that all created users can be found on the server
 			for (String uuid : userUuids) {
 				try {
@@ -383,7 +433,39 @@ public class ChaosClusterTest extends AbstractClusterTest {
 					fail("Error while checking server {" + server.getNodeName() + "} and user {" + uuid + "}");
 				}
 			}
+
+			// Only assert write when we are not in a split brain
+			if (!hasSplitBrain) {
+				// Increase the quorum until we reached the write quorum
+				reachWriteQuorum();
+				sleep(15_000);
+
+				// Verify that node can still be created
+				createNode(server);
+			}
 		}
+	}
+
+	private void reachWriteQuorum() {
+		int missingNodes = missingNodesForWriteQuorum();
+		if (missingNodes > 0) {
+			for (int i = 0; i < missingNodes; i++) {
+				try {
+					System.out.println("Adding node to meet the write quorum requirements.");
+					addServer();
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				}
+			}
+		}
+	}
+
+	private boolean meetsWriteQuorumRequirements() {
+		return missingNodesForWriteQuorum() <= 0;
+	}
+
+	private int missingNodesForWriteQuorum() {
+		return WRITE_QUORUM - runningServers.size();
 	}
 
 }

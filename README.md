@@ -15,8 +15,6 @@ Implemented actions:
 * Kill instance (-9)
 * Utilize instance (Write)
 * Invoke schema migration
-
-Planned actions:
-
 * Split Brain
 * Merge Brain
+
