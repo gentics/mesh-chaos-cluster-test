@@ -309,6 +309,8 @@ public class ChaosClusterTest extends AbstractClusterTest {
 		for (MeshContainer server : runningServers) {
 			try {
 				server.resumeTraffic();
+				// Wait two minutes to re-merge the cluster
+				sleep(120_000);
 			} catch (Exception e) {
 				e.printStackTrace();
 			}
